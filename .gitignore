@@ -2,3 +2,4 @@
 __pycache__/
 bin/ffmpeg.exe
 *report*.txt
+lab/data
