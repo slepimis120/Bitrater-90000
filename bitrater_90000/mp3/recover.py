@@ -11,8 +11,9 @@ SQRT2 = np.sqrt(2)
 
 TOLERANCE = 0.55
 MAX_OUTLIERS = 2
-MIN_RATIO = 8
+MIN_RATIO = 4
 SEARCH_DEPTH = 64
+CLEAN_FIT = 0.8
 
 
 @dataclass
@@ -94,12 +95,7 @@ def _recover_channel(x: np.ndarray, half_width: np.ndarray, k320: np.ndarray,
     return RecoveredChannel(values=values, band_k=band_k, failed_bands=failed)
 
 
-def recover_granule(g0: GranuleData, g1: GranuleData, ms_stereo: bool,
-                    sample_rate: int) -> tuple[RecoveredChannel, RecoveredChannel] | None:
-    if g0.info.window_switching or g1.info.window_switching:
-        return None
-
-    bounds = SFB_LONG[sample_rate]
+def _prepare(g0: GranuleData, g1: GranuleData, ms_stereo: bool, sample_rate: int):
     s0, s1 = step_sizes(g0, sample_rate), step_sizes(g1, sample_rate)
     q0, q1 = np.array(g0.values, float), np.array(g1.values, float)
     x0, x1 = dequantize(q0, s0), dequantize(q1, s1)
@@ -114,8 +110,17 @@ def recover_granule(g0: GranuleData, g1: GranuleData, ms_stereo: bool,
         hw0 = hw1 = (hw0 + hw1) / SQRT2
         k0 = k1 = np.minimum(k0, k1)
 
-    return (_recover_channel(x0, hw0, k0, bounds),
-            _recover_channel(x1, hw1, k1, bounds))
+    return (x0, hw0, k0), (x1, hw1, k1)
+
+
+def recover_granule(g0: GranuleData, g1: GranuleData, ms_stereo: bool,
+                    sample_rate: int) -> tuple[RecoveredChannel, RecoveredChannel] | None:
+    if g0.info.window_switching or g1.info.window_switching:
+        return None
+    
+    bounds = SFB_LONG[sample_rate]
+    mid, side = _prepare(g0, g1, ms_stereo, sample_rate)
+    return _recover_channel(*mid, bounds), _recover_channel(*side, bounds)
 
 
 def recover(frames: list[Frame], decoded: list) -> list:
@@ -130,3 +135,30 @@ def recover(frames: list[Frame], decoded: list) -> list:
             for g0, g1 in granules
         ])
     return result
+
+
+def fit_quality(frames: list[Frame], decoded: list) -> float:
+    audio = [f for f in frames if not f.is_info_frame]
+    clean = total = 0
+    for frame, granules in zip(audio, decoded):
+        if granules is None or frame.header.channels != 2:
+            continue
+        bounds = SFB_LONG[frame.header.sample_rate]
+        for g0, g1 in granules:
+            if g0.info.window_switching or g1.info.window_switching:
+                continue
+            for x, half_width, k320 in _prepare(g0, g1, frame.header.ms_stereo,
+                                                frame.header.sample_rate):
+                parities = []
+                for b in range(21):
+                    lo, hi = bounds[b], bounds[b + 1]
+                    c = _band_candidates(x[lo:hi], half_width[lo:hi],
+                                         int(k320[lo]) + MIN_RATIO, 0)
+                    if c is None:
+                        continue
+                    total += 1
+                    if len(c[0]):
+                        parities.append(int(c[0][0]) % 2)
+                if parities:
+                    clean += max(parities.count(0), parities.count(1))
+    return clean / total if total else 0.0

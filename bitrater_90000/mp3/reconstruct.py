@@ -6,10 +6,11 @@ import numpy as np
 from bitrater_90000.mp3.bitstream import read_frames
 from bitrater_90000.mp3.maindata import GranuleData, decode_main_data
 from bitrater_90000.mp3.params import granule_params
-from bitrater_90000.mp3.recover import recover
+from bitrater_90000.mp3.recover import fit_quality, recover
 from bitrater_90000.mp3.writer import FrameSpec, GranuleSpec, encoded_bits, write_mp3
 
 MAX_COPIED_GRANULE_BITS = 1200
+MAX_GRANULE_BITS = 2000
 
 
 @dataclass
@@ -19,6 +20,7 @@ class ReconstructionStats:
     copied_frames: int
     failed_bands: int
     requantized_bands: int
+    shrunk_granules: int
     bumped_frames: int
     average_kbps: float
 
@@ -60,6 +62,11 @@ def shrink(spec: GranuleSpec, sample_rate: int, max_bits: int) -> GranuleSpec:
     return candidate
 
 
+def recoverability(source: Path, max_frames: int = 1500) -> float:
+    frames = read_frames(source)[: max_frames + 1]
+    return fit_quality(frames, decode_main_data(frames))
+
+
 def reconstruct(source: Path, target: Path, bitrate: int) -> ReconstructionStats:
     frames = read_frames(source)
     audio = [f for f in frames if not f.is_info_frame]
@@ -68,15 +75,24 @@ def reconstruct(source: Path, target: Path, bitrate: int) -> ReconstructionStats
     sample_rate = audio[0].header.sample_rate
 
     specs = []
-    copied = failed = requantized = 0
+    copied = failed = requantized = shrunk = 0
     for frame, granules, rec in zip(audio, decoded, recovered):
         usable = rec is not None and all(pair is not None for pair in rec)
         if usable:
             failed += sum(ch.failed_bands for pair in rec for ch in pair)
             params = [[granule_params(ch, sample_rate) for ch in pair] for pair in rec]
             requantized += sum(p.requantized_bands for pair in params for p in pair)
-            specs.append(FrameSpec(ms_stereo=True,
-                                   granules=[[p.spec for p in pair] for pair in params]))
+            granule_specs = []
+            for pair in params:
+                channel_specs = []
+                for p in pair:
+                    spec = p.spec
+                    if encoded_bits(spec, sample_rate) > MAX_GRANULE_BITS:
+                        spec = shrink(spec, sample_rate, MAX_GRANULE_BITS)
+                        shrunk += 1
+                    channel_specs.append(spec)
+                granule_specs.append(channel_specs)
+            specs.append(FrameSpec(ms_stereo=True, granules=granule_specs))
         else:
             copied += 1
             specs.append(FrameSpec(
@@ -92,6 +108,7 @@ def reconstruct(source: Path, target: Path, bitrate: int) -> ReconstructionStats
         copied_frames=copied,
         failed_bands=failed,
         requantized_bands=requantized,
+        shrunk_granules=shrunk,
         bumped_frames=stats["bumped_frames"],
         average_kbps=stats["average_kbps"],
     )

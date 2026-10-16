@@ -8,6 +8,7 @@ os.environ.setdefault("OPENBLAS_NUM_THREADS", "1")
 
 from bitrater_90000.ffmpeg_tools import find_ffmpeg
 from bitrater_90000.report import analyze_folder, write_report
+from bitrater_90000.convert import MODES, convert_folder, load_overrides, write_convert_report
 
 
 def cmd_report(args) -> None:
@@ -40,6 +41,22 @@ def main() -> None:
     report.add_argument("-j", "--jobs", type=int, default=None,
                         help="number of parallel processes (default: number of CPU cores)")
     report.set_defaults(func=cmd_report)
+    
+    convert = sub.add_parser("convert", help="convert fake tracks to their real bitrate")
+    convert.add_argument("folder", type=Path, help="folder with music (subfolders included)")
+    convert.add_argument("output", type=Path, help="where to write the converted library")
+    convert.add_argument("--mode", choices=MODES, default="auto",
+                         help="auto: reconstruct when possible, otherwise re-encode (default); "
+                              "reencode: always re-encode; tag: only write the real bitrate into a tag")
+    convert.add_argument("--step-up", action="store_true",
+                         help="re-encode one standard bitrate above the real one (less loss)")
+    convert.add_argument("--overrides", type=Path, default=None,
+                         help="file with manual bitrates: '<kbps> <relative path>' per line")
+    convert.add_argument("-r", "--report", type=Path, default=Path("bitrater_convert_report.txt"),
+                         help="report file (default: bitrater_convert_report.txt)")
+    convert.add_argument("-j", "--jobs", type=int, default=None,
+                         help="number of parallel processes (default: number of CPU cores)")
+    convert.set_defaults(func=cmd_convert)
 
     args = parser.parse_args()
     try:
@@ -48,6 +65,25 @@ def main() -> None:
         print("\nInterrupted.")
         raise SystemExit(130)
 
+def cmd_convert(args) -> None:
+    root = args.folder.resolve()
+    output = args.output.resolve()
+    if not root.is_dir():
+        raise SystemExit(f"Folder does not exist: {root}")
+
+    ffmpeg = find_ffmpeg()
+    overrides = load_overrides(args.overrides)
+
+    def on_progress(done, total, result):
+        print(f"[{done}/{total}] {result.action:<13} {result.detail:24} {result.path}")
+
+    try:
+        results = convert_folder(root, output, ffmpeg, args.mode, overrides, args.step_up,
+                                 args.jobs, on_progress)
+    except ValueError as e:
+        raise SystemExit(str(e))
+    write_convert_report(results, root, output, args.report)
+    print(f"\nReport saved to: {args.report.resolve()}")
 
 if __name__ == "__main__":
     multiprocessing.freeze_support()
