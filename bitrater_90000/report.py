@@ -1,11 +1,11 @@
-from concurrent.futures import ProcessPoolExecutor, as_completed
+import threading
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
-import signal
 from typing import Callable
 
 from bitrater_90000.analyzer import AnalysisResult, DamagedFileError, analyze_file
+from bitrater_90000.parallel import run_parallel
 
 FAKE_MARGIN_KBPS = 32
 
@@ -29,14 +29,11 @@ class TrackResult:
             return "FAKE"
         return "OK"
 
-def _ignore_ctrl_c() -> None:
-    signal.signal(signal.SIGINT, signal.SIG_IGN)
-
 def find_mp3_files(root: Path) -> list[Path]:
     return sorted(p for p in root.rglob("*") if p.is_file() and p.suffix.lower() == ".mp3")
 
 
-def _analyze_one(path: Path, ffmpeg: str) -> TrackResult:
+def analyze_track(path: Path, ffmpeg: str) -> TrackResult:
     try:
         return TrackResult(path, analysis=analyze_file(path, ffmpeg))
     except DamagedFileError as e:
@@ -50,24 +47,10 @@ def analyze_folder(
     ffmpeg: str,
     workers: int | None = None,
     on_progress: Callable[[int, int, TrackResult], None] | None = None,
+    cancel: threading.Event | None = None,
 ) -> list[TrackResult]:
-    files = find_mp3_files(root)
-    results = []
-
-    pool = ProcessPoolExecutor(max_workers=workers, initializer=_ignore_ctrl_c)
-    try:
-        futures = [pool.submit(_analyze_one, f, ffmpeg) for f in files]
-        for done, future in enumerate(as_completed(futures), start=1):
-            result = future.result()
-            results.append(result)
-            if on_progress:
-                on_progress(done, len(files), result)
-    except KeyboardInterrupt:
-        pool.shutdown(wait=False, cancel_futures=True)
-        raise
-
-    pool.shutdown()
-    return results
+    tasks = [(path, ffmpeg) for path in find_mp3_files(root)]
+    return run_parallel(analyze_track, tasks, workers, on_progress, cancel)
 
 
 def _by_path(result: TrackResult) -> str:
@@ -78,7 +61,7 @@ def _worst_first(result: TrackResult):
     a = result.analysis
     return a.real_kbps, a.cutoff_hz, _by_path(result)
 
-def _format_cutoff(a: AnalysisResult) -> str:
+def format_cutoff(a: AnalysisResult) -> str:
     prefix = "" if a.sharp_cutoff else "~"
     return f"{prefix}{a.cutoff_hz / 1000:.1f} kHz"
 
@@ -103,7 +86,7 @@ def write_report(results: list[TrackResult], root: Path, out_path: Path) -> None
     for r in rated:
         a = r.analysis
         lines.append(
-            f"{a.real_kbps:>5}  {a.claimed_kbps:>7}  {_format_cutoff(a):>10}  "
+            f"{a.real_kbps:>5}  {a.claimed_kbps:>7}  {format_cutoff(a):>10}  "
             f"{r.status:<6}  {r.path.relative_to(root)}"
         )
 

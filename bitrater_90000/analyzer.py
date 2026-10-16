@@ -42,6 +42,12 @@ class AnalysisResult:
             return None
         return min(self.cutoff_class_kbps, self.claimed_kbps)
 
+    @property
+    def best_guess_kbps(self) -> int:
+        if self.real_kbps is not None:
+            return self.real_kbps
+        return min(cutoff_to_kbps(self.cutoff_hz), self.claimed_kbps)
+
 
 def loud_frames_db(samples: np.ndarray, sample_rate: int, n_fft: int = 4096):
     n_frames = len(samples) // n_fft

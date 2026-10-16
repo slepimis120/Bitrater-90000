@@ -1,18 +1,18 @@
 import os
 import shutil
-import signal
 import subprocess
-from concurrent.futures import ProcessPoolExecutor, as_completed
+import threading
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 from typing import Callable
 
-from bitrater_90000.analyzer import AnalysisResult, DamagedFileError, analyze_file
+from bitrater_90000.analyzer import AnalysisResult
 from bitrater_90000.ffmpeg_tools import NO_WINDOW
 from bitrater_90000.mp3.reconstruct import reconstruct, recoverability
 from bitrater_90000.mp3.recover import CLEAN_FIT
-from bitrater_90000.report import FAKE_MARGIN_KBPS, find_mp3_files
+from bitrater_90000.parallel import run_parallel
+from bitrater_90000.report import FAKE_MARGIN_KBPS, TrackResult, analyze_track, find_mp3_files
 from bitrater_90000.tags import add_real_bitrate, copy_tags
 
 MODES = ("auto", "reencode", "tag")
@@ -43,11 +43,16 @@ def _key(rel: Path) -> str:
     return os.path.normcase(str(rel))
 
 
-def target_bitrate(analysis: AnalysisResult, override: int | None, step_up: bool) -> int | None:
+def target_bitrate(analysis: AnalysisResult, override: int | None, step_up: bool,
+                   guess_uncertain: bool = False) -> int | None:
     if override:
         return override
     real = analysis.real_kbps
-    if real is None or analysis.claimed_kbps - real < FAKE_MARGIN_KBPS:
+    if real is None:
+        if not guess_uncertain:
+            return None
+        real = analysis.best_guess_kbps
+    if analysis.claimed_kbps - real < FAKE_MARGIN_KBPS:
         return None
     if step_up:
         higher = [b for b in STANDARD_BITRATES if b > real]
@@ -65,17 +70,20 @@ def reencode(source: Path, target: Path, kbps: int, ffmpeg: str) -> None:
 
 
 def _convert_one(source: Path, target: Path, rel: Path, ffmpeg: str, mode: str,
-                 override: int | None, step_up: bool) -> ConvertResult:
+                 override: int | None, step_up: bool,
+                 track: TrackResult | None = None,
+                 guess_uncertain: bool = False) -> ConvertResult:
     target.parent.mkdir(parents=True, exist_ok=True)
-    try:
-        analysis = analyze_file(source, ffmpeg)
-    except DamagedFileError as e:
+    if track is None:
+        track = analyze_track(source, ffmpeg)
+    if track.damaged:
         shutil.copy2(source, target)
-        return ConvertResult(rel, "copied", f"damaged, {e}")
-    except Exception as e:
-        return ConvertResult(rel, "failed", f"{type(e).__name__}: {e}")
+        return ConvertResult(rel, "copied", f"damaged, {track.error}")
+    if track.error:
+        return ConvertResult(rel, "failed", track.error)
+    analysis = track.analysis
 
-    kbps = target_bitrate(analysis, override, step_up)
+    kbps = target_bitrate(analysis, override, step_up, guess_uncertain)
     if kbps is None:
         shutil.copy2(source, target)
         return ConvertResult(rel, "copied", "uncertain" if analysis.real_kbps is None else "ok")
@@ -106,10 +114,6 @@ def _convert_one(source: Path, target: Path, rel: Path, ffmpeg: str, mode: str,
     return ConvertResult(rel, action, f"{analysis.claimed_kbps} -> {kbps} kbps")
 
 
-def _ignore_ctrl_c() -> None:
-    signal.signal(signal.SIGINT, signal.SIG_IGN)
-
-
 def convert_folder(
     root: Path,
     output: Path,
@@ -119,31 +123,21 @@ def convert_folder(
     step_up: bool = False,
     workers: int | None = None,
     on_progress: Callable[[int, int, ConvertResult], None] | None = None,
+    cancel: threading.Event | None = None,
+    analyzed: list[TrackResult] | None = None,
+    guess_uncertain: bool = False,
 ) -> list[ConvertResult]:
     if output.resolve().is_relative_to(root.resolve()):
         raise ValueError("The output folder can not be inside the input folder")
     overrides = overrides or {}
-    files = find_mp3_files(root)
-    results = []
+    known = {track.path: track for track in analyzed or []}
 
-    pool = ProcessPoolExecutor(max_workers=workers, initializer=_ignore_ctrl_c)
-    try:
-        futures = []
-        for source in files:
-            rel = source.relative_to(root)
-            futures.append(pool.submit(_convert_one, source, output / rel, rel, ffmpeg, mode,
-                                       overrides.get(_key(rel)), step_up))
-        for done, future in enumerate(as_completed(futures), start=1):
-            result = future.result()
-            results.append(result)
-            if on_progress:
-                on_progress(done, len(files), result)
-    except KeyboardInterrupt:
-        pool.shutdown(wait=False, cancel_futures=True)
-        raise
-
-    pool.shutdown()
-    return results
+    tasks = []
+    for source in find_mp3_files(root):
+        rel = source.relative_to(root)
+        tasks.append((source, output / rel, rel, ffmpeg, mode, overrides.get(_key(rel)),
+                      step_up, known.get(source), guess_uncertain))
+    return run_parallel(_convert_one, tasks, workers, on_progress, cancel)
 
 
 def write_convert_report(results: list[ConvertResult], root: Path, output: Path,

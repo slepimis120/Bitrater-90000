@@ -41,7 +41,7 @@ def main() -> None:
     report.add_argument("-j", "--jobs", type=int, default=None,
                         help="number of parallel processes (default: number of CPU cores)")
     report.set_defaults(func=cmd_report)
-    
+
     convert = sub.add_parser("convert", help="convert fake tracks to their real bitrate")
     convert.add_argument("folder", type=Path, help="folder with music (subfolders included)")
     convert.add_argument("output", type=Path, help="where to write the converted library")
@@ -50,6 +50,8 @@ def main() -> None:
                               "reencode: always re-encode; tag: only write the real bitrate into a tag")
     convert.add_argument("--step-up", action="store_true",
                          help="re-encode one standard bitrate above the real one (less loss)")
+    convert.add_argument("--guess-uncertain", action="store_true",
+                         help="also convert uncertain tracks, using the best guess of their bitrate")
     convert.add_argument("--overrides", type=Path, default=None,
                          help="file with manual bitrates: '<kbps> <relative path>' per line")
     convert.add_argument("-r", "--report", type=Path, default=Path("bitrater_convert_report.txt"),
@@ -79,7 +81,7 @@ def cmd_convert(args) -> None:
 
     try:
         results = convert_folder(root, output, ffmpeg, args.mode, overrides, args.step_up,
-                                 args.jobs, on_progress)
+                                 args.jobs, on_progress, guess_uncertain=args.guess_uncertain)
     except ValueError as e:
         raise SystemExit(str(e))
     write_convert_report(results, root, output, args.report)
